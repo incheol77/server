@@ -521,6 +521,8 @@ enum legacy_db_type
   DB_TYPE_FIRST_DYNAMIC=45,
   DB_TYPE_DEFAULT=127 // Must be last
 };
+
+enum xa_binlog_state {XA_PREPARE=0, XA_COMPLETE};
 /*
   Better name for DB_TYPE_UNKNOWN. Should be used for engines that do not have
   a hard-coded type value here.
@@ -806,16 +808,17 @@ struct st_system_tablename
   const char *tablename;
 };
 
-
 typedef ulonglong my_xid; // this line is the same as in log_event.h
 #define MYSQL_XID_PREFIX "MySQLXid"
 #define MYSQL_XID_PREFIX_LEN 8 // must be a multiple of 8
 #define MYSQL_XID_OFFSET (MYSQL_XID_PREFIX_LEN+sizeof(server_id))
 #define MYSQL_XID_GTRID_LEN (MYSQL_XID_OFFSET+sizeof(my_xid))
 
+#ifndef XIDDATASIZE
 #define XIDDATASIZE MYSQL_XIDDATASIZE
 #define MAXGTRIDSIZE 64
 #define MAXBQUALSIZE 64
+#endif
 
 #define COMPATIBLE_DATA_YES 0
 #define COMPATIBLE_DATA_NO  1
@@ -832,7 +835,7 @@ struct xid_t {
   long formatID;
   long gtrid_length;
   long bqual_length;
-  char data[XIDDATASIZE];  // not \0-terminated !
+  char data[XIDDATASIZE]={0};  // not \0-terminated !
 
   xid_t() {}                                /* Remove gcc warning */
   bool eq(struct xid_t *xid) const
@@ -893,6 +896,13 @@ struct xid_t {
   }
 };
 typedef struct xid_t XID;
+
+struct xa_recovery_member
+{
+   XID xid;
+   enum xa_binlog_state state;
+   bool in_engine_prepare;
+};
 
 /* for recover() handlerton call */
 #define MIN_XID_LIST_SIZE  128
@@ -4992,7 +5002,7 @@ int ha_commit_one_phase(THD *thd, bool all);
 int ha_commit_trans(THD *thd, bool all);
 int ha_rollback_trans(THD *thd, bool all);
 int ha_prepare(THD *thd);
-int ha_recover(HASH *commit_list);
+int ha_recover(HASH *commit_list, HASH *xa_recover_list);
 
 /* transactions: these functions never call handlerton functions directly */
 int ha_enable_transaction(THD *thd, bool on);

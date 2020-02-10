@@ -38,6 +38,7 @@
 #include "log_event.h"          // Query_log_event
 #include "rpl_filter.h"
 #include "rpl_rli.h"
+#include "rpl_mi.h"
 #include "sql_audit.h"
 #include "mysqld.h"
 
@@ -8075,7 +8076,7 @@ MYSQL_BIN_LOG::trx_group_commit_leader(group_commit_entry *leader)
 
     /* Now we have in queue the list of transactions to be committed in order. */
   }
-    
+
   DBUG_ASSERT(is_open());
   if (likely(is_open()))                       // Should always be true
   {
@@ -9764,7 +9765,7 @@ int TC_LOG_MMAP::recover()
         goto err2; // OOM
   }
 
-  if (ha_recover(&xids))
+  if (ha_recover(&xids, 0))
     goto err2;
 
   my_hash_free(&xids);
@@ -9805,7 +9806,7 @@ int TC_LOG::using_heuristic_recover()
     return 0;
 
   sql_print_information("Heuristic crash recovery mode");
-  if (ha_recover(0))
+  if (ha_recover(0, 0))
     sql_print_error("Heuristic crash recovery failed");
   sql_print_information("Please restart mysqld without --tc-heuristic-recover");
   return 1;
@@ -10271,6 +10272,7 @@ int TC_LOG_BINLOG::recover(LOG_INFO *linfo, const char *last_log_name,
 {
   Log_event *ev= NULL;
   HASH xids;
+  HASH xa_recover_list;
   MEM_ROOT mem_root;
   char binlog_checkpoint_name[FN_REFLEN];
   bool binlog_checkpoint_found;
@@ -10284,9 +10286,16 @@ int TC_LOG_BINLOG::recover(LOG_INFO *linfo, const char *last_log_name,
   bool last_gtid_valid= false;
 #endif
 
-  if (! fdle->is_valid() ||
-      (do_xa && my_hash_init(&xids, &my_charset_bin, TC_LOG_PAGE_SIZE/3, 0,
-                             sizeof(my_xid), 0, 0, MYF(0))))
+  binlog_checkpoint_name[0]= 0;
+  if (!fdle->is_valid() ||
+      (do_xa &&
+       my_hash_init(&xids, &my_charset_bin, TC_LOG_PAGE_SIZE/3, 0,
+         sizeof(my_xid), 0, 0, MYF(0))))
+    goto err1;
+  if (do_xa &&
+      my_hash_init(&xa_recover_list, &my_charset_bin, TC_LOG_PAGE_SIZE/3,
+        offsetof(xa_recovery_member,xid),
+        sizeof(XID), 0, 0, MYF(0)))
     goto err1;
 
   if (do_xa)
@@ -10360,21 +10369,79 @@ int TC_LOG_BINLOG::recover(LOG_INFO *linfo, const char *last_log_name,
 
 #ifdef HAVE_REPLICATION
       case GTID_EVENT:
-        if (first_round)
         {
           Gtid_log_event *gev= (Gtid_log_event *)ev;
-
-          /* Update the binlog state with any GTID logged after Gtid_list. */
-          last_gtid.domain_id= gev->domain_id;
-          last_gtid.server_id= gev->server_id;
-          last_gtid.seq_no= gev->seq_no;
-          last_gtid_standalone=
-            ((gev->flags2 & Gtid_log_event::FL_STANDALONE) ? true : false);
-          last_gtid_valid= true;
+          if (first_round)
+          {
+            /* Update the binlog state with any GTID logged after Gtid_list. */
+            last_gtid.domain_id= gev->domain_id;
+            last_gtid.server_id= gev->server_id;
+            last_gtid.seq_no= gev->seq_no;
+            last_gtid_standalone=
+              ((gev->flags2 & Gtid_log_event::FL_STANDALONE) ? true : false);
+            last_gtid_valid= true;
+          }
+          if (do_xa)
+          {
+            if(gev->flags2 & Gtid_log_event::FL_PREPARED_XA)
+            {
+              xa_recovery_member *member= (xa_recovery_member *)
+                alloc_root(&mem_root, sizeof(xa_recovery_member));
+              if (member)
+              {
+                memset(&member->xid,0,sizeof(XID));
+                member->xid.set(&gev->xid);
+                member->state= XA_PREPARE;
+                member->in_engine_prepare= false;
+                if (my_hash_insert(&xa_recover_list,(uchar *) member))
+                  goto err2;
+              }
+              else
+                goto err2;
+            }
+            if(gev->flags2 & Gtid_log_event::FL_COMPLETED_XA)
+            {
+              // Extract XID from gev->xid
+              XID *x= (XID *) alloc_root(&mem_root, sizeof(XID));
+              if (x)
+              {
+                memset(x,0,sizeof(XID));
+                x->set(&gev->xid);
+              }
+              else
+                goto err2;
+              /*
+                Search if XID is already present in recovery_list. If found
+                and the state is 'XA_PREPRAED' mark it as XA_COMPLETE.
+              */
+              struct xa_recovery_member *member= NULL;
+              if ((member= (xa_recovery_member *)
+                    my_hash_search(&xa_recover_list, (uchar *)x, sizeof(XID))))
+              {
+                if (member->state == XA_PREPARE)
+                  member->state= XA_COMPLETE;
+              }
+              else // We found only XA COMMIT during recovery insert to list
+              {
+                xa_recovery_member *member= (xa_recovery_member *)
+                  alloc_root(&mem_root, sizeof(xa_recovery_member));
+                if (member)
+                {
+                  memset(&member->xid,0,sizeof(XID));
+                  member->xid.set(&gev->xid);
+                  member->state= XA_COMPLETE;
+                  member->in_engine_prepare= false;
+                  if (my_hash_insert(&xa_recover_list,(uchar *) member))
+                    goto err2;
+                }
+                else
+                  goto err2;
+              }
+            }
+          }//end do_xa
+          break;
         }
-        break;
 #endif
-
       case START_ENCRYPTION_EVENT:
         {
           if (fdle->start_decryption((Start_encryption_log_event*) ev))
@@ -10464,11 +10531,15 @@ int TC_LOG_BINLOG::recover(LOG_INFO *linfo, const char *last_log_name,
 
   if (do_xa)
   {
-    if (ha_recover(&xids))
+    if (ha_recover(&xids, &xa_recover_list))
       goto err2;
-
+    if (xa_recover_list.records &&
+        recover_explicit_xa_prepare((binlog_checkpoint_name[0] != 0) ?
+          binlog_checkpoint_name : last_log_name, &xa_recover_list))
+      goto err2;
     free_root(&mem_root, MYF(0));
     my_hash_free(&xids);
+    my_hash_free(&xa_recover_list);
   }
   return 0;
 
@@ -10483,6 +10554,7 @@ err2:
   {
     free_root(&mem_root, MYF(0));
     my_hash_free(&xids);
+    my_hash_free(&xa_recover_list);
   }
 err1:
   sql_print_error("Crash recovery failed. Either correct the problem "
@@ -10492,6 +10564,195 @@ err1:
   return 1;
 }
 
+bool MYSQL_BIN_LOG::recover_explicit_xa_prepare(const char *log_name,
+                                                HASH *recover_xids)
+{
+#ifndef HAVE_REPLICATION
+  return false;
+#else
+  bool err= true;
+  int error=0;
+  Relay_log_info *rli;
+  rpl_group_info *rgi;
+  THD *thd;
+  thd= new THD(next_thread_id());  /* Needed by start_slave_threads */
+  thd->thread_stack= (char*) &thd;
+  thd->store_globals();
+  thd->security_ctx->skip_grants();
+  IO_CACHE log;
+  Format_description_log_event fdle(BINLOG_VERSION);
+  const char *errmsg;
+  File        file;
+  bool enable_apply_event= false;
+  Log_event *ev = 0;
+  LOG_INFO linfo;
+  uint recover_xa_count= recover_xids->records;
+
+  /*
+    option_bits will be changed when applying the event. But we don't expect
+    it be changed permanently after BINLOG statement, so backup it first.
+    It will be restored at the end of this function.
+  */
+  ulonglong thd_options= thd->variables.option_bits;
+  rli= thd->rli_fake;
+  if (!rli && (rli= thd->rli_fake= new Relay_log_info(FALSE)))
+    rli->sql_driver_thd= thd;
+  static LEX_CSTRING connection_name= { STRING_WITH_LEN("recovery") };
+  rli->mi= new Master_info(&connection_name, false);
+  if (!(rgi= thd->rgi_fake))
+    rgi= thd->rgi_fake= new rpl_group_info(rli);
+  rgi->thd= thd;
+  thd->system_thread_info.rpl_sql_info=
+    new rpl_sql_thread_info(rli->mi->rpl_filter);
+  xa_recovery_member *member= NULL;
+
+  /*
+     Out of memory check
+  */
+  if (!(rli))
+  {
+    my_error(ER_OUTOFMEMORY, MYF(ME_FATAL), 1);  /* needed 1 bytes */
+    goto err2;
+  }
+  if (rli && !rli->relay_log.description_event_for_exec)
+  {
+    rli->relay_log.description_event_for_exec=
+      new Format_description_log_event(4);
+  }
+  if (find_log_pos(&linfo, log_name, 1))
+  {
+    sql_print_error("Binlog file '%s' not found in binlog index, needed "
+                    "for recovery. Aborting.", log_name);
+    goto err2;
+  }
+
+  for (;;)
+  {
+    if ((file= open_binlog(&log, linfo.log_file_name, &errmsg)) < 0)
+    {
+      sql_print_error("%s", errmsg);
+      goto err2;
+    }
+    while (recover_xa_count &&
+        (ev= Log_event::read_log_event(&log,
+                                       rli->relay_log.description_event_for_exec,
+                                       opt_master_verify_checksum))
+        && ev->is_valid())
+    {
+      enum Log_event_type typ= ev->get_type_code();
+      ev->thd= thd;
+
+      if (typ == FORMAT_DESCRIPTION_EVENT)
+        enable_apply_event= true;
+
+      if (typ == GTID_EVENT)
+      {
+        Gtid_log_event *gev= (Gtid_log_event *)ev;
+        if (gev->flags2 & Gtid_log_event::FL_PREPARED_XA ||
+            gev->flags2 & Gtid_log_event::FL_COMPLETED_XA)
+        {
+          member=NULL;
+          if ((member= (xa_recovery_member *) my_hash_search(recover_xids,
+                  (uchar *)&gev->xid, sizeof(XID))))
+          {
+            /* Got XA PREPARE query in binlog but check member->state. If it is
+               marked as XA_PREPARE then this PREPARE has not seen its end
+               COMMIT/ROLLBACK. Check if it exists in engine in prepared state.
+               If so apply.
+             */
+            if (gev->flags2 & Gtid_log_event::FL_PREPARED_XA)
+            {
+              // XA is prepared in binlog and not present in engine then apply
+              if (member->state == XA_PREPARE &&
+                  member->in_engine_prepare == false)
+                enable_apply_event= true;
+            }
+            else if (gev->flags2 & Gtid_log_event::FL_COMPLETED_XA)
+            {
+              if (member->state == XA_COMPLETE &&
+                  member->in_engine_prepare == true)
+                enable_apply_event= true;
+              else
+                --recover_xa_count;
+            }
+            if (!enable_apply_event)
+            {
+              --recover_xa_count;
+            }
+          }
+        }
+      }
+
+      if (enable_apply_event)
+      {
+        if (typ == XA_PREPARE_LOG_EVENT)
+        {
+          thd->variables.pseudo_slave_mode= TRUE;
+          thd->transaction.xid_state.set_binlogged();
+        }
+        // For XA_COMMIT and XA_ROLLBACK disable binlog temporarily.
+        if (member && member->state == XA_COMPLETE && typ != GTID_EVENT)
+        {
+          thd_options= thd->variables.option_bits;
+          thd->variables.option_bits&= ~OPTION_BIN_LOG;
+          thd->variables.sql_log_bin_off= 1;
+        }
+
+        if ((err= ev->apply_event(rgi)))
+          goto err2;
+
+        // Cleanup on receiving end group events. Disable apply event flag.
+        if (thd->lex->sql_command == SQLCOM_XA_COMMIT ||
+            thd->lex->sql_command == SQLCOM_XA_ROLLBACK)
+        {
+          thd->variables.option_bits= thd_options;
+          thd->variables.sql_log_bin_off= 0;
+          enable_apply_event= false;
+          --recover_xa_count;
+        }
+        if (typ == XA_PREPARE_LOG_EVENT)
+        {
+          enable_apply_event=false;
+          thd->variables.pseudo_slave_mode= FALSE;
+          --recover_xa_count;
+        }
+        if (typ == FORMAT_DESCRIPTION_EVENT)
+        {
+          enable_apply_event=false;
+        }
+      }
+      if (typ != FORMAT_DESCRIPTION_EVENT)
+        delete ev;
+      ev= 0;
+    }
+    end_io_cache(&log);
+    mysql_file_close(file, MYF(MY_WME));
+    file= -1;
+    if (unlikely((error= find_next_log(&linfo, 1))))
+    {
+      if (error != LOG_INFO_EOF)
+        sql_print_error("find_log_pos() failed (error: %d)", error);
+      else
+        break;
+    }
+  }
+  err= false;
+err2:
+  if (file >= 0)
+  {
+    end_io_cache(&log);
+    mysql_file_close(file, MYF(MY_WME));
+  }
+  thd->variables.pseudo_slave_mode= FALSE;
+  thd->variables.option_bits= thd_options;
+  delete rli->mi;
+  delete thd->system_thread_info.rpl_sql_info;
+  rgi->slave_close_thread_tables(thd);
+  thd->reset_globals();
+  delete thd;
+  return err;
+#endif  /* !HAVE_REPLICATION */
+}
 
 int
 MYSQL_BIN_LOG::do_binlog_recovery(const char *opt_name, bool do_xa_recovery)

@@ -1293,6 +1293,9 @@ int ha_prepare(THD *thd)
           error=1;
           break;
         }
+        DEBUG_SYNC(thd, "simulate_hang_after_binlog_prepare");
+        DBUG_EXECUTE_IF("simulate_crash_after_binlog_prepare",
+            DBUG_SUICIDE(););
 
         DBUG_ASSERT(thd->transaction.xid_state.is_explicit_XA());
 
@@ -1808,6 +1811,8 @@ commit_one_phase_2(THD *thd, bool all, THD_TRANS *trans, bool is_real_trans)
         ++count;
       ha_info_next= ha_info->next();
       ha_info->reset(); /* keep it conveniently zero-filled */
+      DBUG_EXECUTE_IF("simulate_crash_after_binlog_commit",
+          DBUG_SUICIDE(););
     }
     trans->ha_list= 0;
     trans->no_2pc=0;
@@ -1921,6 +1926,8 @@ int ha_rollback_trans(THD *thd, bool all)
       status_var_increment(thd->status_var.ha_rollback_count);
       ha_info_next= ha_info->next();
       ha_info->reset(); /* keep it conveniently zero-filled */
+      DBUG_EXECUTE_IF("simulate_crash_after_binlog_rollback",
+          DBUG_SUICIDE(););
     }
     trans->ha_list= 0;
     trans->no_2pc=0;
@@ -2120,6 +2127,7 @@ struct xarecover_st
   int len, found_foreign_xids, found_my_xids;
   XID *list;
   HASH *commit_list;
+  HASH *prepare_list;
   bool dry_run;
 };
 
@@ -2167,8 +2175,23 @@ static my_bool xarecover_handlerton(THD *unused, plugin_ref plugin,
             char buf[XIDDATASIZE*4+6];
             _db_doprnt_("ignore xid %s", xid_to_str(buf, info->list+i));
             });
-          xid_cache_insert(info->list + i, opt_bin_log);
+          XID *foreign_xid= info->list + i;
+          xid_cache_insert(foreign_xid, opt_bin_log);
           info->found_foreign_xids++;
+
+           /*
+             For each foreign xid prepraed in engine, check if it is present in
+             prepare_list sent by binlog.
+           */
+            if (info->prepare_list )
+            {
+              struct xa_recovery_member *member= NULL;
+              if ((member= (xa_recovery_member *) my_hash_search(info->prepare_list,
+                      (uchar *)foreign_xid, sizeof(XID))))
+              {
+                member->in_engine_prepare= true;
+              }
+            }
           continue;
         }
         if (IF_WSREP(!(wsrep_emulate_bin_log &&
@@ -2215,12 +2238,13 @@ static my_bool xarecover_handlerton(THD *unused, plugin_ref plugin,
   return FALSE;
 }
 
-int ha_recover(HASH *commit_list)
+int ha_recover(HASH *commit_list, HASH *prepare_list)
 {
   struct xarecover_st info;
   DBUG_ENTER("ha_recover");
   info.found_foreign_xids= info.found_my_xids= 0;
   info.commit_list= commit_list;
+  info.prepare_list= prepare_list;
   info.dry_run= (info.commit_list==0 && tc_heuristic_recover==0);
   info.list= NULL;
 
