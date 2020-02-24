@@ -620,14 +620,21 @@ bool trans_xa_commit(THD *thd)
           Innodb redo log and bin log update is involved in rollback.
           Return error to user for a retry.
         */
-        xid_state.er_xaer_rmfail();
-        DBUG_RETURN(res);
+        DBUG_ASSERT(thd->is_error());
+
+        xs->acquired_to_recovered();
+        DBUG_RETURN(true);
       }
       DBUG_ASSERT(!xid_state.xid_cache_element);
 
       DEBUG_SYNC(thd, "at_trans_xa_commit");
-      if ((res= thd->wait_for_prior_commit()))
-        DBUG_RETURN(res);
+      if (thd->wait_for_prior_commit())
+      {
+        DBUG_ASSERT(thd->is_error());
+
+        xs->acquired_to_recovered();
+        DBUG_RETURN(true);
+      }
 
       xid_state.xid_cache_element= xs;
       ha_commit_or_rollback_by_xid(thd->lex->xid, !res);
@@ -750,15 +757,21 @@ bool trans_xa_rollback(THD *thd)
           Innodb redo log and bin log update is involved in rollback.
           Return error to user for a retry.
         */
-        xid_state.er_xaer_rmfail();
+        DBUG_ASSERT(thd->is_error());
+
+        xs->acquired_to_recovered();
         DBUG_RETURN(true);
       }
       xa_trans_rolled_back(xs);
       DBUG_ASSERT(!xid_state.xid_cache_element);
 
       DEBUG_SYNC(thd, "at_trans_xa_rollback");
-      if ((res= thd->wait_for_prior_commit()))
-        DBUG_RETURN(res);
+      if (thd->wait_for_prior_commit())
+      {
+        DBUG_ASSERT(thd->is_error());
+        xs->acquired_to_recovered();
+        DBUG_RETURN(true);
+      }
 
       xid_state.xid_cache_element= xs;
       ha_commit_or_rollback_by_xid(thd->lex->xid, 0);
