@@ -10586,7 +10586,7 @@ bool MYSQL_BIN_LOG::recover_explicit_xa_prepare(const char *log_name,
   bool enable_apply_event= false;
   Log_event *ev = 0;
   LOG_INFO linfo;
-  uint recover_xa_count= recover_xids->records;
+  int recover_xa_count= recover_xids->records;
 
   /*
     option_bits will be changed when applying the event. But we don't expect
@@ -10633,7 +10633,7 @@ bool MYSQL_BIN_LOG::recover_explicit_xa_prepare(const char *log_name,
       sql_print_error("%s", errmsg);
       goto err2;
     }
-    while (recover_xa_count &&
+    while (recover_xa_count > 0 &&
         (ev= Log_event::read_log_event(&log,
                                        rli->relay_log.description_event_for_exec,
                                        opt_master_verify_checksum))
@@ -10662,10 +10662,14 @@ bool MYSQL_BIN_LOG::recover_explicit_xa_prepare(const char *log_name,
              */
             if (gev->flags2 & Gtid_log_event::FL_PREPARED_XA)
             {
-              // XA is prepared in binlog and not present in engine then apply
-              if (member->state == XA_PREPARE &&
-                  member->in_engine_prepare == false)
-                enable_apply_event= true;
+              if (member->state == XA_PREPARE)
+              {
+                // XA is prepared in binlog and not present in engine then apply
+                if (member->in_engine_prepare == false)
+                  enable_apply_event= true;
+                else
+                  --recover_xa_count;
+              }
             }
             else if (gev->flags2 & Gtid_log_event::FL_COMPLETED_XA)
             {
@@ -10674,10 +10678,6 @@ bool MYSQL_BIN_LOG::recover_explicit_xa_prepare(const char *log_name,
                 enable_apply_event= true;
               else
                 --recover_xa_count;
-            }
-            if (!enable_apply_event)
-            {
-              --recover_xa_count;
             }
           }
         }
@@ -10736,6 +10736,12 @@ bool MYSQL_BIN_LOG::recover_explicit_xa_prepare(const char *log_name,
         break;
     }
   }
+  /*
+    There should be no more XA transactions to recover upon successful
+    completion.
+  */
+  if (recover_xa_count > 0)
+    goto err2;
   err= false;
 err2:
   if (file >= 0)

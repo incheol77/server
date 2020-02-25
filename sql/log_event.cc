@@ -18,7 +18,7 @@
 
 #include "mariadb.h"
 #include "sql_priv.h"
-
+#include "handler.h"
 #ifndef MYSQL_CLIENT
 #include "unireg.h"
 #include "log_event.h"
