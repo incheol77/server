@@ -40,11 +40,6 @@ Slave_reporting_capability::report(loglevel level, int err_code,
   va_list args;
   va_start(args, msg);
 
-  /* early return in case of recovery event replay error */
-  THD *thd= current_thd;
-  if (thd && thd->rgi_fake)
-    return;
-
   mysql_mutex_lock(&err_lock);
   switch (level)
   {
@@ -76,7 +71,8 @@ Slave_reporting_capability::report(loglevel level, int err_code,
   va_end(args);
 
   /* If the msg string ends with '.', do not add a ',' it would be ugly */
-  report_function("Slave %s: %s%s %s%sInternal MariaDB error code: %d",
+  report_function("%s %s: %s%s %s%sInternal MariaDB error code: %d",
+                  (current_thd && current_thd->rgi_fake) ? "" : "Slave",
                   m_thread_name, pbuff,
                   (pbuff[0] && *(strend(pbuff)-1) == '.') ? "" : ",",
                   (extra_info ? extra_info : ""), (extra_info ? ", " : ""),

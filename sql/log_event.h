@@ -3243,11 +3243,6 @@ public:
 #ifdef MYSQL_SERVER
   bool write();
 #endif
-
-private:
-#if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)
-  char query[sizeof("XA COMMIT ONE PHASE") + 1 + ser_buf_size];
-  int do_commit();
   const char* get_query()
   {
     sprintf(query,
@@ -3255,6 +3250,11 @@ private:
             m_xid.serialize());
     return query;
   }
+
+private:
+#if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)
+  char query[sizeof("XA COMMIT ONE PHASE") + 1 + ser_buf_size];
+  int do_commit();
 #endif
 };
 
