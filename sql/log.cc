@@ -10588,12 +10588,6 @@ bool MYSQL_BIN_LOG::recover_explicit_xa_prepare(const char *log_name,
   LOG_INFO linfo;
   int recover_xa_count= recover_xids->records;
 
-  /*
-    option_bits will be changed when applying the event. But we don't expect
-    it be changed permanently after BINLOG statement, so backup it first.
-    It will be restored at the end of this function.
-  */
-  ulonglong thd_options= thd->variables.option_bits;
   rli= thd->rli_fake;
   if (!rli && (rli= thd->rli_fake= new Relay_log_info(FALSE)))
     rli->sql_driver_thd= thd;
@@ -10606,6 +10600,7 @@ bool MYSQL_BIN_LOG::recover_explicit_xa_prepare(const char *log_name,
     new rpl_sql_thread_info(rli->mi->rpl_filter);
   xa_recovery_member *member= NULL;
 
+  tmp_disable_binlog(thd);
   /*
      Out of memory check
   */
@@ -10690,23 +10685,40 @@ bool MYSQL_BIN_LOG::recover_explicit_xa_prepare(const char *log_name,
           thd->variables.pseudo_slave_mode= TRUE;
           thd->transaction.xid_state.set_binlogged();
         }
-        // For XA_COMMIT and XA_ROLLBACK disable binlog temporarily.
-        if (member && member->state == XA_COMPLETE && typ != GTID_EVENT)
-        {
-          thd_options= thd->variables.option_bits;
-          thd->variables.option_bits&= ~OPTION_BIN_LOG;
-          thd->variables.sql_log_bin_off= 1;
-        }
-
         if ((err= ev->apply_event(rgi)))
-          goto err2;
+        {
+          // TODO: XA-COMMIT|ROLLBACK failure is tolerated ...
+          if (typ == FORMAT_DESCRIPTION_EVENT || typ == GTID_EVENT ||
+              member->state != XA_COMPLETE)
+          {
+            goto err2;
+          }
+          else
+          {
+            DBUG_ASSERT(typ == QUERY_EVENT);
+
+            sql_print_warning("Failed to execute binlog query event %s"
+                " at %s:%lu; error %d %s",
+                static_cast<Query_log_event *>(ev)->query,
+                linfo.log_file_name, (ev->log_pos - ev->data_written),
+                rgi->thd->get_stmt_da()->sql_errno(), /* todo: test */
+                rgi->thd->get_stmt_da()->message());
+          }
+        }
+        //TODO Add support for typ == XA_PREPARE_LOG_EVENT
+        else if (typ != FORMAT_DESCRIPTION_EVENT &&
+            (member->state == XA_COMPLETE && typ == QUERY_EVENT))
+        {
+          sql_print_information("Binlog event %s at %s:%lu"
+              " successfully applied",
+              static_cast<Query_log_event *>(ev)->query,
+              linfo.log_file_name, (ev->log_pos - ev->data_written));
+        }
 
         // Cleanup on receiving end group events. Disable apply event flag.
         if (thd->lex->sql_command == SQLCOM_XA_COMMIT ||
             thd->lex->sql_command == SQLCOM_XA_ROLLBACK)
         {
-          thd->variables.option_bits= thd_options;
-          thd->variables.sql_log_bin_off= 0;
           enable_apply_event= false;
           --recover_xa_count;
         }
@@ -10742,15 +10754,16 @@ bool MYSQL_BIN_LOG::recover_explicit_xa_prepare(const char *log_name,
   */
   if (recover_xa_count > 0)
     goto err2;
+  sql_print_information("Crash recovery finished.");
   err= false;
 err2:
+  reenable_binlog(thd);
   if (file >= 0)
   {
     end_io_cache(&log);
     mysql_file_close(file, MYF(MY_WME));
   }
   thd->variables.pseudo_slave_mode= FALSE;
-  thd->variables.option_bits= thd_options;
   delete rli->mi;
   delete thd->system_thread_info.rpl_sql_info;
   rgi->slave_close_thread_tables(thd);

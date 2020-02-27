@@ -2291,7 +2291,7 @@ int ha_recover(HASH *commit_list, HASH *prepare_list)
                     info.found_my_xids, opt_tc_log_file);
     DBUG_RETURN(1);
   }
-  if (info.commit_list)
+  if (info.commit_list && !info.found_foreign_xids)
     sql_print_information("Crash recovery finished.");
   DBUG_RETURN(0);
 }

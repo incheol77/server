@@ -19,6 +19,7 @@
 #include "rpl_reporting.h"
 #include "log.h" // sql_print_error, sql_print_warning,
                  // sql_print_information
+#include "sql_class.h"
 
 Slave_reporting_capability::Slave_reporting_capability(char const *thread_name)
   : m_thread_name(thread_name)
@@ -38,6 +39,11 @@ Slave_reporting_capability::report(loglevel level, int err_code,
   uint pbuffsize= sizeof(buff);
   va_list args;
   va_start(args, msg);
+
+  /* early return in case of recovery event replay error */
+  THD *thd= current_thd;
+  if (thd && thd->rgi_fake)
+    return;
 
   mysql_mutex_lock(&err_lock);
   switch (level)
