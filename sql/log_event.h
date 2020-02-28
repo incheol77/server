@@ -3242,7 +3242,7 @@ public:
 
 #ifdef MYSQL_SERVER
   bool write();
-#endif
+#ifdef HAVE_REPLICATION
   const char* get_query()
   {
     sprintf(query,
@@ -3250,6 +3250,8 @@ public:
             m_xid.serialize());
     return query;
   }
+#endif /* HAVE_REPLICATION */
+#endif /* MYSQL_SERVER */
 
 private:
 #if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)

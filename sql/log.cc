@@ -10642,8 +10642,8 @@ bool MYSQL_BIN_LOG::recover_explicit_xa_prepare(const char *log_name,
       if (typ == GTID_EVENT)
       {
         Gtid_log_event *gev= (Gtid_log_event *)ev;
-        if (gev->flags2 & Gtid_log_event::FL_PREPARED_XA ||
-            gev->flags2 & Gtid_log_event::FL_COMPLETED_XA)
+        if (gev->flags2 &
+            (Gtid_log_event::FL_PREPARED_XA | Gtid_log_event::FL_COMPLETED_XA))
         {
           member=NULL;
           if ((member= (xa_recovery_member *) my_hash_search(recover_xids,
@@ -10683,10 +10683,13 @@ bool MYSQL_BIN_LOG::recover_explicit_xa_prepare(const char *log_name,
           thd->transaction.xid_state.set_binlogged();
         if ((err= ev->apply_event(rgi)))
         {
-            sql_print_error("Failed to execute binlog query event %s"
+            sql_print_error("Failed to execute binlog query event of type: %s,"
                             " at %s:%lu; error %d %s", ev->get_type_str(),
                             linfo.log_file_name,
-                            (ev->log_pos - ev->data_written));
+                            (ev->log_pos - ev->data_written),
+                            thd->get_stmt_da()->sql_errno(),
+                            thd->get_stmt_da()->message());
+            delete ev;
             goto err1;
         }
         else if (typ == FORMAT_DESCRIPTION_EVENT)
