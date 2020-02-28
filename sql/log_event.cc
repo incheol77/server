@@ -2812,6 +2812,7 @@ XA_prepare_log_event(const char* buf,
   buf += sizeof(temp);
   memcpy(&temp, buf, sizeof(temp));
   m_xid.gtrid_length= uint4korr(&temp);
+  // Todo: validity here and elsewhere checks to be replaced by MDEV-21839 fixes
   if (m_xid.gtrid_length < 0 || m_xid.gtrid_length > MAXGTRIDSIZE)
   {
     m_xid.formatID= -1;

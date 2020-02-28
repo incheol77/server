@@ -2186,8 +2186,9 @@ static my_bool xarecover_handlerton(THD *unused, plugin_ref plugin,
             if (info->prepare_list )
             {
               struct xa_recovery_member *member= NULL;
-              if ((member= (xa_recovery_member *) my_hash_search(info->prepare_list,
-                      (uchar *)foreign_xid, sizeof(XID))))
+              if ((member= (xa_recovery_member *)
+                   my_hash_search(info->prepare_list, foreign_xid->key(),
+                                  foreign_xid->key_length())))
               {
                 member->in_engine_prepare= true;
               }

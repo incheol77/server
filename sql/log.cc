@@ -10265,16 +10265,33 @@ start_binlog_background_thread()
   return 0;
 }
 
-inline bool member_insert(HASH *hash_arg, xa_recovery_member *member,
-                           xid_t *xid_arg, xa_binlog_state state_arg)
+/**
+  Auxiliary function for ::recover().
+  @returns a successfully created and inserted @c xa_recovery_member
+             into hash @c hash_arg,
+           or NULL.
+*/
+inline xa_recovery_member*
+member_insert(HASH *hash_arg, xid_t *xid_arg, xa_binlog_state state_arg,
+              MEM_ROOT *mem_root)
 {
-  memset(&member->xid,0,sizeof(XID));
+  xa_recovery_member *member= (xa_recovery_member*)
+    alloc_root(mem_root, sizeof(xa_recovery_member));
+  if (!member)
+    return NULL;
+
   member->xid.set(xid_arg);
   member->state= state_arg;
   member->in_engine_prepare= false;
-  return my_hash_insert(hash_arg, (uchar *) member);
+  return my_hash_insert(hash_arg, (uchar*) member) ? NULL : member;
 }
 
+extern "C" uchar *xid_get_var_key(xid_t *entry, size_t *length,
+                              my_bool not_used __attribute__((unused)))
+{
+  *length= entry->key_length();
+  return (uchar*) entry->key();
+}
 
 int TC_LOG_BINLOG::recover(LOG_INFO *linfo, const char *last_log_name,
                            IO_CACHE *first_log,
@@ -10302,9 +10319,11 @@ int TC_LOG_BINLOG::recover(LOG_INFO *linfo, const char *last_log_name,
        (my_hash_init(&xids, &my_charset_bin, TC_LOG_PAGE_SIZE/3,
                      0,
                      sizeof(my_xid), 0, 0, MYF(0)) ||
-        my_hash_init(&xa_recover_list, &my_charset_bin, TC_LOG_PAGE_SIZE/3,
-                     offsetof(xa_recovery_member,xid),
-                     sizeof(XID), 0, 0, MYF(0)))))
+        my_hash_init(&xa_recover_list,
+                     &my_charset_bin,
+                     TC_LOG_PAGE_SIZE/3,
+                     0, 0,
+                     (my_hash_get_key) xid_get_var_key,  0, MYF(0)))))
     goto err1;
 
   if (do_xa)
@@ -10394,42 +10413,28 @@ int TC_LOG_BINLOG::recover(LOG_INFO *linfo, const char *last_log_name,
           {
             if(gev->flags2 & Gtid_log_event::FL_PREPARED_XA)
             {
-              xa_recovery_member *member= (xa_recovery_member *)
-                alloc_root(&mem_root, sizeof(xa_recovery_member));
-              if (!member ||
-                  member_insert(&xa_recover_list, member, &gev->xid, XA_PREPARE))
+              if (!(member_insert(&xa_recover_list,
+                                  &gev->xid, XA_PREPARE, &mem_root)))
                 goto err2;
-            }
-            if(gev->flags2 & Gtid_log_event::FL_COMPLETED_XA)
+            } else if(gev->flags2 & Gtid_log_event::FL_COMPLETED_XA)
             {
-              // Extract XID from gev->xid
-              XID *x= (XID *) alloc_root(&mem_root, sizeof(XID));
-              if (x)
-              {
-                memset(x,0,sizeof(XID));
-                x->set(&gev->xid);
-              }
-              else
-                goto err2;
               /*
                 Search if XID is already present in recovery_list. If found
                 and the state is 'XA_PREPRAED' mark it as XA_COMPLETE.
                 Effectively, there won't be XA-prepare event group replay.
               */
-              struct xa_recovery_member *member= NULL;
+              xa_recovery_member* member;
               if ((member= (xa_recovery_member *)
-                    my_hash_search(&xa_recover_list, (uchar *)x, sizeof(XID))))
+                   my_hash_search(&xa_recover_list, gev->xid.key(),
+                                  gev->xid.key_length())))
               {
                 if (member->state == XA_PREPARE)
                   member->state= XA_COMPLETE;
               }
               else // We found only XA COMMIT during recovery insert to list
               {
-                xa_recovery_member *member= (xa_recovery_member *)
-                  alloc_root(&mem_root, sizeof(xa_recovery_member));
-                if (!member ||
-                    member_insert(&xa_recover_list, member, &gev->xid,
-                                  XA_COMPLETE))
+                if (!(member= member_insert(&xa_recover_list,
+                                            &gev->xid, XA_COMPLETE, &mem_root)))
                   goto err2;
               }
             }
@@ -10645,9 +10650,10 @@ bool MYSQL_BIN_LOG::recover_explicit_xa_prepare(const char *log_name,
         if (gev->flags2 &
             (Gtid_log_event::FL_PREPARED_XA | Gtid_log_event::FL_COMPLETED_XA))
         {
-          member=NULL;
-          if ((member= (xa_recovery_member *) my_hash_search(recover_xids,
-                  (uchar *)&gev->xid, sizeof(XID))))
+          if ((member=
+               (xa_recovery_member*) my_hash_search(recover_xids,
+                                                    gev->xid.key(),
+                                                    gev->xid.key_length())))
           {
             /* Got XA PREPARE query in binlog but check member->state. If it is
                marked as XA_PREPARE then this PREPARE has not seen its end
