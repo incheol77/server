@@ -3407,6 +3407,7 @@ MYSQL_BIN_LOG::MYSQL_BIN_LOG(uint *sync_period)
   index_file_name[0] = 0;
   bzero((char*) &index_file, sizeof(index_file));
   bzero((char*) &purge_index_file, sizeof(purge_index_file));
+  xa_recover_list.records= 0;
 }
 
 void MYSQL_BIN_LOG::stop_background_thread()
@@ -3468,6 +3469,11 @@ void MYSQL_BIN_LOG::cleanup()
     mysql_cond_destroy(&COND_xid_list);
     mysql_cond_destroy(&COND_binlog_background_thread);
     mysql_cond_destroy(&COND_binlog_background_thread_end);
+    if (!is_relay_log && xa_recover_list.records)
+    {
+      free_root(&mem_root, MYF(0));
+      my_hash_free(&xa_recover_list);
+    }
   }
 
   /*
@@ -10299,9 +10305,6 @@ int TC_LOG_BINLOG::recover(LOG_INFO *linfo, const char *last_log_name,
 {
   Log_event *ev= NULL;
   HASH xids;
-  HASH xa_recover_list;
-  MEM_ROOT mem_root;
-  char binlog_checkpoint_name[FN_REFLEN];
   bool binlog_checkpoint_found;
   bool first_round;
   IO_CACHE log;
@@ -10533,13 +10536,16 @@ int TC_LOG_BINLOG::recover(LOG_INFO *linfo, const char *last_log_name,
   {
     if (ha_recover(&xids, &xa_recover_list))
       goto err2;
-    if (xa_recover_list.records &&
-        recover_explicit_xa_prepare((binlog_checkpoint_name[0] != 0) ?
-          binlog_checkpoint_name : last_log_name, &xa_recover_list))
-      goto err2;
-    free_root(&mem_root, MYF(0));
+
+    DBUG_ASSERT(!xa_recover_list.records ||
+                (binlog_checkpoint_found && binlog_checkpoint_name[0] != 0));
+
+    if (!xa_recover_list.records)
+    {
+      free_root(&mem_root, MYF(0));
+      my_hash_free(&xa_recover_list);
+    }
     my_hash_free(&xids);
-    my_hash_free(&xa_recover_list);
   }
   return 0;
 
@@ -10564,13 +10570,22 @@ err1:
   return 1;
 }
 
-bool MYSQL_BIN_LOG::recover_explicit_xa_prepare(const char *log_name,
-                                                HASH *recover_xids)
+void MYSQL_BIN_LOG::execute_xa_for_recovery()
+{
+  if (xa_recover_list.records)
+    (void) recover_explicit_xa_prepare();
+  free_root(&mem_root, MYF(0));
+  my_hash_free(&xa_recover_list);
+};
+
+bool MYSQL_BIN_LOG::recover_explicit_xa_prepare()
 {
 #ifndef HAVE_REPLICATION
   /* Can't be supported without replication applier built in. */
   return false;
 #else
+  const char *log_name= binlog_checkpoint_name;
+  HASH *recover_xids= &xa_recover_list;
   bool err= true;
   int error=0;
   Relay_log_info *rli= NULL;

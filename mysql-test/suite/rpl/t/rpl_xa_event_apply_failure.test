@@ -11,11 +11,11 @@
 #    1 - For 'xa2' let the XA COMMIT be done in binary log and crash the
 #        server so that it is not committed in engine.
 #    2 - Restart the server. Using debug simulation point make XA COMMIT 'xa2'
-#        execution to fail. Check for appropriate error in log.
-#    3 - Restart server without debug simulation.    
-#    4 - Check the data in table. Both rows should be present in table.
-#    5 - Trying to commit 'xa2' should report unknown 'XA' error as COMMIT is
-#        already complete during recovery.
+#        execution to fail. The server will resume anyway
+#        to leave the error in the errlog (see "Recovery: Error..").
+#    3 - Work around the simulated failure with Commit once again
+#        from a connection that turns OFF binlogging.
+#        Slave must catch up with the master.
 #
 # ==== References ====
 #
@@ -75,13 +75,25 @@ EOF
 connection default;
 --source include/wait_until_disconnected.inc
 
---append_file $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-restart
-EOF
-
 connection default;
 --enable_reconnect
 --source include/wait_until_connected_again.inc
+
+--connection master
+--enable_reconnect
+--echo *** must be no 'xa2' commit seen, as it's still prepared:
+SELECT * FROM t;
+XA RECOVER;
+
+# Commit it manually now to work around the extra binlog record
+# by turning binlogging OFF by the connection.
+
+SET GLOBAL DEBUG_DBUG="";
+SET SQL_LOG_BIN=0;
+--error 0
+XA COMMIT 'xa2';
+SET SQL_LOG_BIN=1;
+
 
 # rpl_end.inc needs to use the connection server_1
 connection server_1;
@@ -89,7 +101,6 @@ connection server_1;
 --source include/wait_until_connected_again.inc
 
 --connection master
---enable_reconnect
 --source include/wait_until_connected_again.inc
 
 --connection slave
@@ -98,12 +109,8 @@ connection server_1;
 
 --connection master
 SELECT * FROM t;
-XA RECOVER;
---error 1397 # ER_XAER_NOTA
-XA COMMIT 'xa2';
-SELECT * FROM t;
---sync_slave_with_master
 
+--sync_slave_with_master
 SELECT * FROM t;
 
 --connection master
